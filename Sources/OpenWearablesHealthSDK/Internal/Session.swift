@@ -187,12 +187,19 @@ extension OpenWearablesHealthSDK {
     // MARK: - Get Sync Status
     
     internal func getSyncStatusDict() -> [String: Any] {
+        // Whether the initial full export (newest-first crawl of the whole history)
+        // has ever completed for this user. False = historical sync still pending
+        // or in progress; apps can use this to show a "keep the app open" hint.
+        let initialExportDone = defaults.bool(forKey: fullDoneKey())
+        
         if let state = loadSyncState() {
             return [
                 "hasResumableSession": state.hasProgress,
                 "sentCount": state.totalSentCount,
                 "completedTypes": state.completedTypes.count,
                 "isFullExport": state.fullExport,
+                "initialExportDone": initialExportDone,
+                "isSyncing": isSyncInProgress,
                 "createdAt": ISO8601DateFormatter().string(from: state.createdAt)
             ]
         } else {
@@ -201,6 +208,8 @@ extension OpenWearablesHealthSDK {
                 "sentCount": 0,
                 "completedTypes": 0,
                 "isFullExport": false,
+                "initialExportDone": initialExportDone,
+                "isSyncing": isSyncInProgress,
                 "createdAt": NSNull()
             ]
         }

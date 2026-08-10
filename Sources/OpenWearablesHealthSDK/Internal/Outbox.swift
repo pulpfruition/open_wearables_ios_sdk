@@ -26,60 +26,6 @@ extension OpenWearablesHealthSDK {
         return outboxDir().appendingPathComponent("\(name).\(ext)")
     }
 
-    // MARK: - Background upload with persistence
-    internal func enqueueBackgroundUpload(
-        payload: [String: Any],
-        type: HKSampleType,
-        candidateAnchor: HKQueryAnchor?,
-        endpoint: URL,
-        credential: String,
-        completion: @escaping () -> Void
-    ) {
-        guard let data = try? JSONSerialization.data(withJSONObject: payload) else {
-            completion()
-            return
-        }
-        let id = UUID().uuidString
-        let payloadURL = newPath("payload_\(id)", ext: "json")
-        do {
-            try data.write(to: payloadURL, options: Data.WritingOptions.atomic)
-        } catch {
-            completion()
-            return
-        }
-
-        var anchorURL: URL? = nil
-        if let cand = candidateAnchor,
-           let ad = try? NSKeyedArchiver.archivedData(withRootObject: cand, requiringSecureCoding: true) {
-            let u = newPath("anchor_\(id)", ext: "bin")
-            try? ad.write(to: u, options: Data.WritingOptions.atomic)
-            anchorURL = u
-        }
-
-        let item = OutboxItem(
-            typeIdentifier: type.identifier,
-            userKey: userKey(),
-            payloadPath: payloadURL.path,
-            anchorPath: anchorURL?.path,
-            wasFullExport: nil
-        )
-        let itemURL = newPath("item_\(id)", ext: "json")
-        if let md = try? JSONEncoder().encode(item) {
-            try? md.write(to: itemURL, options: Data.WritingOptions.atomic)
-        }
-
-        var req = URLRequest(url: endpoint)
-        req.httpMethod = "POST"
-        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        applyAuth(to: &req, credential: credential)
-
-        let task = session.uploadTask(with: req, fromFile: payloadURL)
-        task.taskDescription = [itemURL.path, payloadURL.path, anchorURL?.path ?? ""].joined(separator: "|")
-        task.resume()
-
-        completion()
-    }
-    
     // MARK: - Combined upload
     internal func enqueueCombinedUpload(
         payload: [String: Any],
@@ -338,68 +284,106 @@ extension OpenWearablesHealthSDK {
     }
 
     // MARK: - Retry pending items
+    
+    /// Minimum file age before an outbox item is retried (the original upload may
+    /// still be in flight).
+    private static let outboxMinRetryAge: TimeInterval = 30
+    /// Items older than this are dropped - the data is re-fetched from HealthKit by
+    /// the regular sync anyway, so there is no point in re-sending week-old batches.
+    private static let outboxMaxItemAge: TimeInterval = 7 * 24 * 3600
+    
+    /// Retries pending outbox items through the *background* URLSession.
+    /// - uploads go through the background session (survive suspension/kill),
+    /// - the session is limited to one connection per host, so items go out serially,
+    /// - a retry pass is skipped while a regular sync is running,
+    /// - only one retry pass can run at a time,
+    /// - items already enqueued in the background session are not enqueued again.
     internal func retryOutboxIfPossible() {
         guard let endpoint = self.syncEndpoint, let credential = self.authCredential else { return }
-        let dir = outboxDir()
-        guard let files = try? FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil) else { return }
         
-        let regularItems = files.filter { $0.lastPathComponent.hasPrefix("item_") && $0.pathExtension == "json" && !$0.lastPathComponent.hasPrefix("combined_item_") }
-        let combinedItems = files.filter { $0.lastPathComponent.hasPrefix("combined_item_") && $0.pathExtension == "json" }
-
-        for itemURL in regularItems {
-            if let attrs = try? FileManager.default.attributesOfItem(atPath: itemURL.path),
-               let mdate = attrs[.modificationDate] as? Date,
-               Date().timeIntervalSince(mdate) < 30 {
-                continue
-            }
-            guard let data = try? Data(contentsOf: itemURL),
-                  let item = try? JSONDecoder().decode(OutboxItem.self, from: data) else { continue }
-            let payloadURL = URL(fileURLWithPath: item.payloadPath)
-            guard FileManager.default.fileExists(atPath: payloadURL.path),
-                  let payloadData = try? Data(contentsOf: payloadURL) else { continue }
-            
-            var req = URLRequest(url: endpoint)
-            req.httpMethod = "POST"
-            req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-            applyAuth(to: &req, credential: credential)
-            req.httpBody = payloadData
-            req.setValue("\(payloadData.count)", forHTTPHeaderField: "Content-Length")
-
-            let task = foregroundSession.dataTask(with: req) { data, response, error in
-                if let httpResponse = response as? HTTPURLResponse, (200...299).contains(httpResponse.statusCode) {
-                    try? FileManager.default.removeItem(atPath: payloadURL.path)
-                    try? FileManager.default.removeItem(atPath: itemURL.path)
-                }
-            }
-            task.resume()
+        if isSyncInProgress {
+            logMessage("Outbox retry skipped - sync in progress")
+            return
         }
         
-        for itemURL in combinedItems {
-            if let attrs = try? FileManager.default.attributesOfItem(atPath: itemURL.path),
-               let mdate = attrs[.modificationDate] as? Date,
-               Date().timeIntervalSince(mdate) < 30 {
-                continue
+        outboxRetryLock.lock()
+        if isRetryingOutbox {
+            outboxRetryLock.unlock()
+            return
+        }
+        isRetryingOutbox = true
+        outboxRetryLock.unlock()
+        
+        session.getAllTasks { [weak self] tasks in
+            guard let self = self else { return }
+            defer {
+                self.outboxRetryLock.lock()
+                self.isRetryingOutbox = false
+                self.outboxRetryLock.unlock()
             }
-            guard let itemData = try? Data(contentsOf: itemURL),
-                  let item = try? JSONDecoder().decode(OutboxItem.self, from: itemData) else { continue }
-            let payloadURL = URL(fileURLWithPath: item.payloadPath)
-            guard FileManager.default.fileExists(atPath: payloadURL.path),
-                  let payloadData = try? Data(contentsOf: payloadURL) else { continue }
-
-            var req = URLRequest(url: endpoint)
-            req.httpMethod = "POST"
-            req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-            applyAuth(to: &req, credential: credential)
-            req.httpBody = payloadData
-            req.setValue("\(payloadData.count)", forHTTPHeaderField: "Content-Length")
-
-            let task = foregroundSession.dataTask(with: req) { data, response, error in
-                if let httpResponse = response as? HTTPURLResponse, (200...299).contains(httpResponse.statusCode) {
-                    self.handleSuccessfulUpload(itemPath: itemURL.path, anchorPath: item.anchorPath, wasFullExport: item.wasFullExport ?? false)
-                    try? FileManager.default.removeItem(atPath: payloadURL.path)
+            
+            // Payloads already queued in the background session (possibly from a
+            // previous app run) must not be enqueued a second time.
+            let inFlightPayloadPaths = Set(tasks.compactMap { task -> String? in
+                let parts = task.taskDescription?.split(separator: "|", omittingEmptySubsequences: false)
+                guard let parts = parts, parts.count > 1 else { return nil }
+                return String(parts[1])
+            })
+            
+            let dir = self.outboxDir()
+            guard let files = try? FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil) else { return }
+            
+            let itemFiles = files.filter {
+                $0.pathExtension == "json" &&
+                ($0.lastPathComponent.hasPrefix("item_") || $0.lastPathComponent.hasPrefix("combined_item_"))
+            }
+            
+            var enqueued = 0
+            for itemURL in itemFiles {
+                guard let attrs = try? FileManager.default.attributesOfItem(atPath: itemURL.path),
+                      let mdate = attrs[.modificationDate] as? Date else { continue }
+                let age = Date().timeIntervalSince(mdate)
+                if age < Self.outboxMinRetryAge { continue }
+                
+                guard let data = try? Data(contentsOf: itemURL),
+                      let item = try? JSONDecoder().decode(OutboxItem.self, from: data) else {
+                    try? FileManager.default.removeItem(at: itemURL)
+                    continue
                 }
+                
+                let payloadURL = URL(fileURLWithPath: item.payloadPath)
+                guard FileManager.default.fileExists(atPath: payloadURL.path) else {
+                    // Orphaned metadata without a payload - clean up
+                    try? FileManager.default.removeItem(at: itemURL)
+                    continue
+                }
+                
+                if age > Self.outboxMaxItemAge {
+                    self.logMessage("Outbox: dropping stale item (\(Int(age / 3600))h old)")
+                    try? FileManager.default.removeItem(at: payloadURL)
+                    if let anchorPath = item.anchorPath {
+                        try? FileManager.default.removeItem(atPath: anchorPath)
+                    }
+                    try? FileManager.default.removeItem(at: itemURL)
+                    continue
+                }
+                
+                if inFlightPayloadPaths.contains(payloadURL.path) { continue }
+                
+                var req = URLRequest(url: endpoint)
+                req.httpMethod = "POST"
+                req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+                self.applyAuth(to: &req, credential: credential)
+                
+                let task = self.session.uploadTask(with: req, fromFile: payloadURL)
+                task.taskDescription = [itemURL.path, payloadURL.path, item.anchorPath ?? ""].joined(separator: "|")
+                task.resume()
+                enqueued += 1
             }
-            task.resume()
+            
+            if enqueued > 0 {
+                self.logMessage("Outbox: enqueued \(enqueued) pending upload(s) to background session")
+            }
         }
     }
 }

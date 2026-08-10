@@ -172,54 +172,6 @@ public enum HealthDataType: String, CaseIterable, Sendable {
 
 extension OpenWearablesHealthSDK {
 
-    // MARK: - Public API
-    internal func serialize(samples: [HKSample], type: HKSampleType) -> [String: Any] {
-        var workouts: [[String: Any]] = []
-        var records: [[String: Any]] = []
-        var sleep: [[String: Any]] = []
-        let df = ISO8601DateFormatter()
-
-        for s in samples {
-            if let w = s as? HKWorkout {
-                workouts.append(_mapWorkout(w))
-            } else if let q = s as? HKQuantitySample {
-                records.append(_mapQuantity(q))
-            } else if let c = s as? HKCategorySample {
-                if c.categoryType.identifier == HKCategoryTypeIdentifier.sleepAnalysis.rawValue {
-                    sleep.append(_mapSleep(c))
-                } else {
-                    records.append(_mapCategory(c))
-                }
-            } else if let corr = s as? HKCorrelation {
-                records.append(contentsOf: _mapCorrelation(corr))
-            } else {
-                records.append([
-                    "id": s.uuid.uuidString,
-                    "type": s.sampleType.identifier,
-                    "startDate": df.string(from: s.startDate),
-                    "endDate": df.string(from: s.endDate),
-                    "zoneOffset": _zoneOffsetString(metadata: s.metadata, date: s.startDate),
-                    "source": _mapSource(s.sourceRevision, device: s.device),
-                    "value": NSNull(),
-                    "unit": NSNull(),
-                    "parentId": NSNull(),
-                    "metadata": _metadataDict(s.metadata)
-                ])
-            }
-        }
-
-        return [
-            "provider": "apple",
-            "sdkVersion": OpenWearablesHealthSDK.sdkVersion,
-            "syncTimestamp": df.string(from: Date()),
-            "data": [
-                "workouts": workouts,
-                "records": records,
-                "sleep": sleep
-            ]
-        ]
-    }
-    
     // MARK: - Memory-efficient streaming serialization
     internal func serializeCombinedStreaming(samples: [HKSample]) -> [String: Any] {
         var workouts: [[String: Any]] = []

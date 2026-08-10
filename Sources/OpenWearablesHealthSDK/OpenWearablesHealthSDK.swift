@@ -108,7 +108,6 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
     internal var session: URLSession!
     internal var foregroundSession: URLSession!
     internal var trackedTypes: [HKSampleType] = []
-    internal var chunkSize: Int = 1000
     internal var backgroundChunkSize: Int = 100
     internal var recordsPerChunk: Int = 2000
     
@@ -124,6 +123,16 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
     private let syncLock = NSLock()
     internal var fullSyncStartTime: Date?
     
+    internal var isSyncInProgress: Bool {
+        syncLock.lock()
+        defer { syncLock.unlock() }
+        return isSyncing
+    }
+    
+    // Outbox retry state
+    internal var isRetryingOutbox = false
+    internal let outboxRetryLock = NSLock()
+    
     // Network monitoring
     private var networkMonitor: NWPathMonitor?
     private let networkMonitorQueue = DispatchQueue(label: "health_sync_network_monitor")
@@ -132,6 +141,9 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
     // Protected data monitoring
     private var protectedDataObserver: NSObjectProtocol?
     internal var pendingSyncAfterUnlock = false
+    
+    // Foreground monitoring (resume sync when app returns to foreground)
+    private var foregroundObserver: NSObjectProtocol?
 
     // Per-user state (anchors)
     internal let defaults = UserDefaults(suiteName: "com.openwearables.healthsdk.state") ?? .standard
@@ -174,6 +186,11 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
         let bgCfg = URLSessionConfiguration.background(withIdentifier: bgSessionId)
         bgCfg.isDiscretionary = false
         bgCfg.waitsForConnectivity = true
+        // Outbox retries go through this session. Serialize them (one connection at a
+        // time instead of a parallel burst) and cap how long a stale batch may linger
+        // in the system (default resource timeout is 7 days).
+        bgCfg.httpMaximumConnectionsPerHost = 1
+        bgCfg.timeoutIntervalForResource = 3600
         self.session = URLSession(configuration: bgCfg, delegate: self, delegateQueue: nil)
         
         let fgCfg = URLSessionConfiguration.default
@@ -259,6 +276,7 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
         stopBackgroundDelivery()
         stopNetworkMonitoring()
         stopProtectedDataMonitoring()
+        stopForegroundMonitoring()
         cancelAllBGTasks()
         resetAllAnchors()
         clearSyncSession()
@@ -350,6 +368,7 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
         startBackgroundDelivery()
         startNetworkMonitoring()
         startProtectedDataMonitoring()
+        startForegroundMonitoring()
         
         initialSyncKickoff { started in
             if started {
@@ -381,13 +400,9 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
         stopBackgroundDelivery()
         stopNetworkMonitoring()
         stopProtectedDataMonitoring()
+        stopForegroundMonitoring()
         cancelAllBGTasks()
         OpenWearablesHealthSdkKeychain.setSyncActive(false)
-    }
-    
-    /// Trigger an immediate sync.
-    public func syncNow(completion: @escaping () -> Void) {
-        syncAll(fullExport: false, completion: completion)
     }
     
     /// Whether sync is currently active.
@@ -450,10 +465,15 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
         startBackgroundDelivery()
         startNetworkMonitoring()
         startProtectedDataMonitoring()
+        startForegroundMonitoring()
         scheduleAppRefresh()
         scheduleProcessing()
         
-        if hasResumableSyncSession() {
+        // Resume when there is a session with progress, but also when the initial
+        // full export never completed (e.g. it was interrupted before its first
+        // successful upload - such a session has no progress to detect).
+        let fullDone = defaults.bool(forKey: fullDoneKey())
+        if hasResumableSyncSession() || !fullDone {
             logMessage("Found interrupted sync, will resume...")
             syncAll(fullExport: false) {
                 self.logMessage("Resumed sync completed")
@@ -514,7 +534,8 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
         
         if observerBgTask == .invalid {
             observerBgTask = UIApplication.shared.beginBackgroundTask(withName: "health_combined_sync") {
-                self.logMessage("Background task expired")
+                self.logMessage("Background task expired - cancelling in-flight uploads")
+                self.cancelInFlightForegroundUploads()
                 UIApplication.shared.endBackgroundTask(self.observerBgTask)
                 self.observerBgTask = .invalid
             }
@@ -577,15 +598,32 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
         logMessage("Types to sync (\(queryableTypes.count)): \(typeNames)")
         
         let existingState = loadSyncState()
-        let isResuming = existingState != nil && existingState!.hasProgress
-        
+        let fullDone = defaults.bool(forKey: fullDoneKey())
+
         let effectiveFullExport: Bool
-        if isResuming {
-            effectiveFullExport = existingState!.fullExport
-            logMessage("Resuming sync (fullExport: \(effectiveFullExport), \(existingState!.totalSentCount) already sent, \(existingState!.completedTypes.count) types done)")
+        if let state = existingState, state.fullExport {
+            effectiveFullExport = true
+        } else if !fullDone {
+            effectiveFullExport = true
         } else {
             effectiveFullExport = fullExport
-            logMessage("Starting streaming sync (fullExport: \(effectiveFullExport), \(queryableTypes.count) types)")
+        }
+        if effectiveFullExport && !fullExport {
+            logMessage("Escalating to full export (initial export not completed yet)")
+        }
+        
+        if let state = existingState, state.fullExport == effectiveFullExport {
+            if state.hasProgress {
+                logMessage("Resuming sync (fullExport: \(effectiveFullExport), \(state.totalSentCount) already sent, \(state.completedTypes.count) types done)")
+            } else {
+                logMessage("Continuing sync session (fullExport: \(effectiveFullExport), no progress yet)")
+            }
+        } else {
+            if let state = existingState {
+                logMessage("Replacing session (fullExport: \(state.fullExport)) - starting streaming sync (fullExport: \(effectiveFullExport))")
+            } else {
+                logMessage("Starting streaming sync (fullExport: \(effectiveFullExport), \(queryableTypes.count) types)")
+            }
             _ = startNewSyncState(fullExport: effectiveFullExport, types: queryableTypes)
         }
         
@@ -671,9 +709,13 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
         }
         
         if !fullExport {
+            let fullDone = defaults.bool(forKey: fullDoneKey())
             for type in types where !rrState.completedTypes.contains(type.identifier) && rrState.anchorCursors[type.identifier] == nil {
                 if let anchor = loadAnchor(for: type) {
                     rrState.anchorCursors[type.identifier] = anchor
+                } else if !fullDone {
+                    logMessage("\(shortTypeName(type.identifier)): no anchor and full export not completed - skipping incremental for this type")
+                    rrState.completedTypes.insert(type.identifier)
                 }
             }
         }
@@ -742,7 +784,7 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
             let emptyDone = results.filter { $0.samples.isEmpty && $0.isDone }
             for result in emptyDone {
                 if !fullExport {
-                    self.updateTypeProgress(typeIdentifier: result.type.identifier, sentInChunk: 0, isComplete: true, anchorData: nil)
+                    self.updateTypeProgress(typeIdentifier: result.type.identifier, sentInChunk: 0, isComplete: true, anchorData: result.anchorData)
                 }
                 rrState.completedTypes.insert(result.type.identifier)
                 if fullExport { self.fireTypeCompletedLog(result.type.identifier) }
@@ -756,7 +798,8 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
             
             if allSamples.isEmpty {
                 if fullExport && !doneTypesForAnchorCapture.isEmpty {
-                    self.captureAnchorsForDoneTypes(types: doneTypesForAnchorCapture, index: 0, rrState: rrState) {
+                    self.captureAnchorsForDoneTypes(types: doneTypesForAnchorCapture, index: 0, rrState: rrState) { captureOk in
+                        guard captureOk else { completion(false); return }
                         self.processNextRound(
                             types: types, fullExport: fullExport, endpoint: endpoint,
                             chunkLimit: chunkLimit, rrState: rrState,
@@ -775,6 +818,19 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
             
             guard let freshCredential = self.authCredential else {
                 self.logMessage("No auth credential available for upload")
+                completion(false)
+                return
+            }
+            
+            // When the app runs in the background it lives on a ~30s task assertion.
+            // Don't start an upload that almost certainly cannot finish before
+            // expiration. The margin is deliberately small (a chunk upload takes
+            // ~1-3s) to use as much of the background window as possible: cursors
+            // and anchors only advance on a server 2xx, so even if the very last
+            // upload gets cut by expiration the batch is simply re-sent (and
+            // deduplicated server-side) when the sync resumes.
+            if let remaining = self.backgroundTimeRemainingIfInBackground(), remaining < 5 {
+                self.logMessage("Background time low (\(Int(remaining))s left) - pausing sync before next upload")
                 completion(false)
                 return
             }
@@ -809,7 +865,8 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
                 // Phase 4: For full export, capture anchors for done types
                 let fullExportDone = withData.filter { $0.isDone }.map { $0.type } + doneTypesForAnchorCapture.filter { t in !withData.contains(where: { $0.type == t }) }
                 if fullExport && !fullExportDone.isEmpty {
-                    self.captureAnchorsForDoneTypes(types: fullExportDone, index: 0, rrState: rrState) {
+                    self.captureAnchorsForDoneTypes(types: fullExportDone, index: 0, rrState: rrState) { captureOk in
+                        guard captureOk else { completion(false); return }
                         self.processNextRound(
                             types: types, fullExport: fullExport, endpoint: endpoint,
                             chunkLimit: chunkLimit, rrState: rrState,
@@ -883,20 +940,28 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
     
     private func captureAnchorsForDoneTypes(
         types: [HKSampleType], index: Int, rrState: RoundRobinState,
-        completion: @escaping () -> Void
+        completion: @escaping (Bool) -> Void
     ) {
         guard index < types.count else {
-            completion()
+            completion(true)
             return
         }
         
         let type = types[index]
         captureCurrentAnchor(for: type) { [weak self] anchor in
-            guard let self = self else { completion(); return }
-            var anchorData: Data? = nil
-            if let anchor = anchor {
-                anchorData = try? NSKeyedArchiver.archivedData(withRootObject: anchor, requiringSecureCoding: true)
+            guard let self = self else { completion(false); return }
+            
+            // Without a valid anchor the type must NOT be marked complete: the next
+            // incremental sync would run an anchored query from nil and re-crawl the
+            // whole history oldest-first. Pause the sync instead - on resume the type
+            // re-sends its last chunk (deduplicated server-side) and retries capture.
+            guard let anchor = anchor,
+                  let anchorData = try? NSKeyedArchiver.archivedData(withRootObject: anchor, requiringSecureCoding: true) else {
+                self.logMessage("  \(self.shortTypeName(type.identifier)): anchor capture failed - leaving type incomplete, pausing sync")
+                completion(false)
+                return
             }
+            
             self.updateTypeProgress(typeIdentifier: type.identifier, sentInChunk: 0, isComplete: true, anchorData: anchorData)
             rrState.completedTypes.insert(type.identifier)
             self.fireTypeCompletedLog(type.identifier)
@@ -997,19 +1062,24 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
                 }
                 
                 let samples = samplesOrNil ?? []
-                if samples.isEmpty {
-                    self.logMessage("  \(self.shortTypeName(type.identifier)): complete")
-                    completion(true, [], nil, nil, true)
-                    return
-                }
+                let deletedCount = deletedObjects?.count ?? 0
                 
                 var anchorData: Data? = nil
                 if let newAnchor = newAnchor {
                     anchorData = try? NSKeyedArchiver.archivedData(withRootObject: newAnchor, requiringSecureCoding: true)
                 }
                 
-                let isLastChunk = samples.count < chunkLimit
-                self.logMessage("  \(self.shortTypeName(type.identifier)): \(samples.count) samples")
+                if samples.isEmpty && deletedCount == 0 {
+                    self.logMessage("  \(self.shortTypeName(type.identifier)): complete")
+                    completion(true, [], newAnchor, anchorData, true)
+                    return
+                }
+                
+                // Deleted objects count against the query limit. Ignoring them made a
+                // chunk with samples + deletions look like the last one, so the anchor
+                // for the remaining (unfetched) data was never advanced.
+                let isLastChunk = (samples.count + deletedCount) < chunkLimit
+                self.logMessage("  \(self.shortTypeName(type.identifier)): \(samples.count) samples" + (deletedCount > 0 ? ", \(deletedCount) deleted" : ""))
                 completion(true, samples, newAnchor, anchorData, isLastChunk)
             }
         }
@@ -1030,9 +1100,25 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
             return HKQuery.predicateForSamples(withStart: start, end: nil, options: [])
         }()
         let query = HKAnchoredObjectQuery(type: type, predicate: syncPredicate, anchor: anchor, limit: limit) {
-            [weak self] _, samples, _, newAnchor, error in
+            [weak self] _, samples, deletedObjects, newAnchor, error in
             guard let self = self else { completion(nil); return }
-            let count = samples?.count ?? 0
+            
+            if let error = error {
+                // A failed step must not return a stale/nil anchor - the caller would
+                // persist it and the next incremental sync would re-crawl history.
+                if self.isProtectedDataError(error) {
+                    self.logMessage("\(self.shortTypeName(type.identifier)): protected data inaccessible during anchor capture - will retry after unlock")
+                    self.pendingSyncAfterUnlock = true
+                } else {
+                    self.logMessage("\(self.shortTypeName(type.identifier)): anchor capture failed - \(error.localizedDescription)")
+                }
+                completion(nil)
+                return
+            }
+            
+            // Deleted objects count against the query limit too. Ignoring them made
+            // the recursion stop early with an anchor that wasn't fully advanced.
+            let count = (samples?.count ?? 0) + (deletedObjects?.count ?? 0)
             if count >= limit {
                 self.captureAnchorStep(type: type, anchor: newAnchor, limit: limit, completion: completion)
             } else {
@@ -1048,6 +1134,30 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
         isSyncing = false
         isInitialSyncInProgress = false
         syncLock.unlock()
+    }
+    
+    /// Returns the remaining background execution time when the app is in the
+    /// background, or `nil` when it is active (foreground has no time limit).
+    /// UIApplication state must be read on the main thread; sync uploads complete
+    /// on the main queue, so guard against deadlocking with `Thread.isMainThread`.
+    private func backgroundTimeRemainingIfInBackground() -> TimeInterval? {
+        let read: () -> TimeInterval? = {
+            guard UIApplication.shared.applicationState == .background else { return nil }
+            return UIApplication.shared.backgroundTimeRemaining
+        }
+        if Thread.isMainThread {
+            return read()
+        }
+        return DispatchQueue.main.sync(execute: read)
+    }
+    
+    /// Cancels in-flight foreground uploads. Called from BG task expiration handlers
+    /// so requests are terminated cleanly instead of being frozen mid-transfer when
+    /// the app gets suspended (which leaves the server with a dangling connection).
+    internal func cancelInFlightForegroundUploads() {
+        foregroundSession.getAllTasks { tasks in
+            for task in tasks { task.cancel() }
+        }
     }
     
     internal func cancelSync() {
@@ -1079,38 +1189,6 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
         syncLock.unlock()
         
         logMessage("Sync cancelled")
-    }
-    
-    internal func syncType(_ type: HKSampleType, fullExport: Bool, completion: @escaping () -> Void) {
-        let anchor = fullExport ? nil : loadAnchor(for: type)
-        
-        let syncPredicate: NSPredicate? = {
-            guard let start = syncStartDate() else { return nil }
-            return HKQuery.predicateForSamples(withStart: start, end: nil, options: [])
-        }()
-        let query = HKAnchoredObjectQuery(type: type, predicate: syncPredicate, anchor: anchor, limit: chunkSize) {
-            [weak self] _, samplesOrNil, deletedObjects, newAnchor, error in
-            guard let self = self else { completion(); return }
-            guard error == nil else { completion(); return }
-
-            let samples = samplesOrNil ?? []
-            guard !samples.isEmpty else { completion(); return }
-            
-            guard let credential = self.authCredential, let endpoint = self.syncEndpoint else {
-                completion()
-                return
-            }
-
-            let payload = self.serialize(samples: samples, type: type)
-            self.enqueueBackgroundUpload(payload: payload, type: type, candidateAnchor: newAnchor, endpoint: endpoint, credential: credential) {
-                if samples.count == self.chunkSize {
-                    self.syncType(type, fullExport: false, completion: completion)
-                } else {
-                    completion()
-                }
-            }
-        }
-        healthStore.execute(query)
     }
     
     // MARK: - Logging
@@ -1355,6 +1433,54 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
         pendingSyncAfterUnlock = false
     }
     
+    // MARK: - Foreground Monitoring
+    
+    /// Resumes an interrupted sync when the app returns to the foreground.
+    /// A sync paused in the background (e.g. "Background time low") had no
+    /// trigger to continue once the user reopened the app - observers only fire
+    /// on new HealthKit data and BG tasks run opportunistically much later.
+    internal func startForegroundMonitoring() {
+        guard foregroundObserver == nil else { return }
+        
+        foregroundObserver = NotificationCenter.default.addObserver(
+            forName: UIApplication.didBecomeActiveNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            self?.tryResumeAfterForeground()
+        }
+        
+        logMessage("Foreground monitoring started")
+    }
+    
+    internal func stopForegroundMonitoring() {
+        if let observer = foregroundObserver {
+            NotificationCenter.default.removeObserver(observer)
+            foregroundObserver = nil
+        }
+    }
+    
+    private func tryResumeAfterForeground() {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+            guard let self = self else { return }
+            
+            guard OpenWearablesHealthSdkKeychain.isSyncActive(), self.hasAuth else { return }
+            
+            let fullDone = self.defaults.bool(forKey: self.fullDoneKey())
+            guard self.hasResumableSyncSession() || !fullDone else { return }
+            
+            guard !self.isSyncInProgress else {
+                self.logMessage("Sync already in progress after foreground")
+                return
+            }
+            
+            self.logMessage("App returned to foreground - resuming sync...")
+            self.syncAll(fullExport: false) {
+                self.logMessage("Foreground resume sync completed")
+            }
+        }
+    }
+    
     internal func markNetworkError() {
         wasDisconnected = true
     }
@@ -1363,7 +1489,8 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
         DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
             guard let self = self else { return }
             
-            guard self.hasResumableSyncSession() else {
+            let fullDone = self.defaults.bool(forKey: self.fullDoneKey())
+            guard self.hasResumableSyncSession() || !fullDone else {
                 self.logMessage("No sync to resume")
                 return
             }

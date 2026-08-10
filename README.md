@@ -84,9 +84,6 @@ sdk.requestAuthorization(types: [.steps, .heartRate, .sleep]) { granted in
     }
 }
 
-// Trigger immediate sync
-sdk.syncNow { }
-
 // Stop sync
 sdk.stopBackgroundSync()
 

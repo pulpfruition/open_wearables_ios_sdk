@@ -150,6 +150,8 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
 
     // Observer queries
     internal var activeObserverQueries: [HKObserverQuery] = []
+    internal let observerCompletionLock = NSLock()
+    internal var observerCompletionHandlers: [() -> Void] = []
 
     // Background session
     internal let bgSessionId = "com.openwearables.healthsdk.upload.session"
@@ -526,10 +528,17 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
         self.collectAllData(fullExport: fullExport, completion: completion)
     }
     
-    internal func triggerCombinedSync() {
+    internal func triggerCombinedSync(observerCompletion: (() -> Void)? = nil) {
         if isInitialSyncInProgress {
-            logMessage("Skipping - initial sync in progress")
+            logMessage("Skipping observer-triggered sync - initial sync in progress")
+            observerCompletion?()
             return
+        }
+
+        if let observerCompletion {
+            observerCompletionLock.lock()
+            observerCompletionHandlers.append(observerCompletion)
+            observerCompletionLock.unlock()
         }
         
         if observerBgTask == .invalid {
@@ -546,6 +555,7 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
         let workItem = DispatchWorkItem { [weak self] in
             guard let self = self else { return }
             self.syncAll(fullExport: false) {
+                self.finishObserverCompletions()
                 if self.observerBgTask != .invalid {
                     UIApplication.shared.endBackgroundTask(self.observerBgTask)
                     self.observerBgTask = .invalid
@@ -557,6 +567,17 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
         syncDebounceQueue.asyncAfter(deadline: .now() + 2.0, execute: workItem)
     }
     
+    internal func finishObserverCompletions() {
+        observerCompletionLock.lock()
+        let completions = observerCompletionHandlers
+        observerCompletionHandlers.removeAll()
+        observerCompletionLock.unlock()
+
+        for completion in completions {
+            completion()
+        }
+    }
+
     internal func collectAllData(fullExport: Bool, completion: @escaping () -> Void) {
         collectAllData(fullExport: fullExport, isBackground: false, completion: completion)
     }

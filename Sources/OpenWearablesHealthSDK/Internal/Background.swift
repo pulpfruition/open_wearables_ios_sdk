@@ -25,8 +25,7 @@ extension OpenWearablesHealthSDK {
                     return
                 }
 
-                self.triggerCombinedSync()
-                completionHandler()
+                self.triggerCombinedSync(observerCompletion: completionHandler)
             }
             healthStore.execute(observer)
             activeObserverQueries.append(observer)
@@ -104,6 +103,7 @@ extension OpenWearablesHealthSDK {
         task.expirationHandler = {
             self.logMessage("BGAppRefresh task expired - cancelling in-flight uploads")
             self.cancelInFlightForegroundUploads()
+            self.finishObserverCompletions()
             op.cancel()
         }
         op.completionBlock = { task.setTaskCompleted(success: !op.isCancelled) }
@@ -133,6 +133,7 @@ extension OpenWearablesHealthSDK {
         task.expirationHandler = {
             self.logMessage("BGProcessing task expired - cancelling in-flight uploads")
             self.cancelInFlightForegroundUploads()
+            self.finishObserverCompletions()
             op.cancel()
         }
         op.completionBlock = { task.setTaskCompleted(success: !op.isCancelled) }

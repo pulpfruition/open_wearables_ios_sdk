@@ -672,9 +672,10 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
             let endDate = Date()
             // Start streaming immediately. A full HealthKit census across every tracked
             // type can take minutes or never complete on large, long-lived stores.
-            sendSyncStartLog(types: queryableTypes, typeCounts: nil, startDate: startDate, endDate: endDate) {
-                startRoundRobin()
-            }
+            sendSyncStartLog(types: queryableTypes, typeCounts: nil, startDate: startDate, endDate: endDate) { }
+            // Telemetry must never gate HealthKit export. Start the functional path
+            // immediately even if logging is slow, offline, or unavailable.
+            startRoundRobin()
         } else {
             startRoundRobin()
         }

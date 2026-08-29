@@ -545,6 +545,7 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
             observerBgTask = UIApplication.shared.beginBackgroundTask(withName: "health_combined_sync") {
                 self.logMessage("Background task expired - cancelling in-flight uploads")
                 self.cancelInFlightForegroundUploads()
+                self.finishObserverCompletions()
                 UIApplication.shared.endBackgroundTask(self.observerBgTask)
                 self.observerBgTask = .invalid
             }

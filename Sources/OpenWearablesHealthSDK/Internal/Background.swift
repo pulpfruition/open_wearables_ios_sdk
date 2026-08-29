@@ -35,6 +35,7 @@ extension OpenWearablesHealthSDK {
     }
 
     internal func stopBackgroundDelivery() {
+        finishObserverCompletions()
         for q in activeObserverQueries { healthStore.stop(q) }
         activeObserverQueries.removeAll()
         

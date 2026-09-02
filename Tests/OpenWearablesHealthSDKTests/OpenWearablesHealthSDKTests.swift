@@ -8,6 +8,15 @@ final class OpenWearablesHealthSDKTests: XCTestCase {
         XCTAssertNotNil(sdk)
     }
     
+    func testForegroundNetworkingDoesNotUseMainQueue() {
+        let sdk = OpenWearablesHealthSDK.shared
+        let queue = sdk.foregroundSession.delegateQueue
+
+        XCTAssertFalse(queue === OperationQueue.main)
+        XCTAssertEqual(queue.maxConcurrentOperationCount, 1)
+        XCTAssertEqual(queue.qualityOfService, .utility)
+    }
+
     func testConfigureSetsHost() {
         let sdk = OpenWearablesHealthSDK.shared
         sdk.configure(host: "https://test.example.com")

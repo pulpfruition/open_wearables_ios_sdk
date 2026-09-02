@@ -114,6 +114,17 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
     // Debouncing
     private var pendingSyncWorkItem: DispatchWorkItem?
     private let syncDebounceQueue = DispatchQueue(label: "health_sync_debounce")
+    private let foregroundSyncQueue = DispatchQueue(
+        label: "health_sync_foreground",
+        qos: .utility
+    )
+    private let foregroundNetworkQueue: OperationQueue = {
+        let queue = OperationQueue()
+        queue.name = "com.openwearables.healthsdk.foreground-network"
+        queue.maxConcurrentOperationCount = 1
+        queue.qualityOfService = .utility
+        return queue
+    }()
     private var observerBgTask: UIBackgroundTaskIdentifier = .invalid
     
     // Sync flags
@@ -199,7 +210,11 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
         fgCfg.timeoutIntervalForRequest = 120
         fgCfg.timeoutIntervalForResource = 600
         fgCfg.waitsForConnectivity = false
-        self.foregroundSession = URLSession(configuration: fgCfg, delegate: nil, delegateQueue: OperationQueue.main)
+        self.foregroundSession = URLSession(
+            configuration: fgCfg,
+            delegate: nil,
+            delegateQueue: foregroundNetworkQueue
+        )
 
         if #available(iOS 13.0, *) {
             BGTaskScheduler.shared.register(forTaskWithIdentifier: refreshTaskId, using: nil) { [weak self] task in
@@ -822,14 +837,14 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
                 if fullExport && !doneTypesForAnchorCapture.isEmpty {
                     self.captureAnchorsForDoneTypes(types: doneTypesForAnchorCapture, index: 0, rrState: rrState) { captureOk in
                         guard captureOk else { completion(false); return }
-                        self.processNextRound(
+                        self.scheduleNextRound(
                             types: types, fullExport: fullExport, endpoint: endpoint,
                             chunkLimit: chunkLimit, rrState: rrState,
                             completion: completion
                         )
                     }
                 } else {
-                    self.processNextRound(
+                    self.scheduleNextRound(
                         types: types, fullExport: fullExport, endpoint: endpoint,
                         chunkLimit: chunkLimit, rrState: rrState,
                         completion: completion
@@ -889,14 +904,14 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
                 if fullExport && !fullExportDone.isEmpty {
                     self.captureAnchorsForDoneTypes(types: fullExportDone, index: 0, rrState: rrState) { captureOk in
                         guard captureOk else { completion(false); return }
-                        self.processNextRound(
+                        self.scheduleNextRound(
                             types: types, fullExport: fullExport, endpoint: endpoint,
                             chunkLimit: chunkLimit, rrState: rrState,
                             completion: completion
                         )
                     }
                 } else {
-                    self.processNextRound(
+                    self.scheduleNextRound(
                         types: types, fullExport: fullExport, endpoint: endpoint,
                         chunkLimit: chunkLimit, rrState: rrState,
                         completion: completion
@@ -906,6 +921,27 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
         }
     }
     
+    private func scheduleNextRound(
+        types: [HKSampleType], fullExport: Bool, endpoint: URL,
+        chunkLimit: Int, rrState: RoundRobinState,
+        completion: @escaping (Bool) -> Void
+    ) {
+        let run = { [weak self] in
+            guard let self = self else { completion(false); return }
+            self.processNextRound(
+                types: types, fullExport: fullExport, endpoint: endpoint,
+                chunkLimit: chunkLimit, rrState: rrState, completion: completion
+            )
+        }
+
+        guard backgroundTimeRemainingIfInBackground() == nil else {
+            run()
+            return
+        }
+
+        foregroundSyncQueue.asyncAfter(deadline: .now() + 0.15, execute: run)
+    }
+
     // MARK: - Fetch all types in a round (no network, accumulates results)
     
     private func fetchTypesInRound(

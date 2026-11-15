@@ -1,6 +1,12 @@
 import Foundation
 import HealthKit
 
+private enum HealthKitQuantityIdentifiers {
+    static let heartRateVariabilityRMSSD = HKQuantityTypeIdentifier(
+        rawValue: "HKQuantityTypeIdentifierHeartRateVariabilityRMSSD"
+    )
+}
+
 // MARK: - Public Health Data Type Enum
 
 /// Supported HealthKit data types for authorization and sync.
@@ -163,7 +169,9 @@ public enum HealthDataType: String, CaseIterable, Sendable {
             // compile this type out instead of failing the build.
             #if compiler(>=6.4)
             if #available(iOS 27.0, *) {
-                return HKObjectType.quantityType(forIdentifier: .heartRateVariabilityRMSSD)
+                return HKObjectType.quantityType(
+                    forIdentifier: HealthKitQuantityIdentifiers.heartRateVariabilityRMSSD
+                )
             }
             #endif
             return nil
@@ -568,7 +576,9 @@ extension OpenWearablesHealthSDK {
             }
             #if compiler(>=6.4)
             if #available(iOS 27.0, *) {
-                if qt == HKObjectType.quantityType(forIdentifier: .heartRateVariabilityRMSSD) {
+                if qt == HKObjectType.quantityType(
+                    forIdentifier: HealthKitQuantityIdentifiers.heartRateVariabilityRMSSD
+                ) {
                     return .secondUnit(with: .milli)
                 }
             }
@@ -677,7 +687,9 @@ extension OpenWearablesHealthSDK {
             }
             #if compiler(>=6.4)
             if #available(iOS 27.0, *) {
-                if qt == HKObjectType.quantityType(forIdentifier: .heartRateVariabilityRMSSD) {
+                if qt == HKObjectType.quantityType(
+                    forIdentifier: HealthKitQuantityIdentifiers.heartRateVariabilityRMSSD
+                ) {
                     return (.secondUnit(with: .milli), "ms")
                 }
             }

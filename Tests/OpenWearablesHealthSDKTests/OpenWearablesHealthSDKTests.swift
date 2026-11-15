@@ -279,7 +279,7 @@ final class OpenWearablesHealthSDKTests: XCTestCase {
         if #available(iOS 27.0, *) {
             XCTAssertEqual(
                 HealthDataType.heartRateVariabilityRMSSD.toHKSampleType()?.identifier,
-                HKQuantityTypeIdentifier.heartRateVariabilityRMSSD.rawValue
+                "HKQuantityTypeIdentifierHeartRateVariabilityRMSSD"
             )
         } else {
             XCTAssertNil(HealthDataType.heartRateVariabilityRMSSD.toHKSampleType())
